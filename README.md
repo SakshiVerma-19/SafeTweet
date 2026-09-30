@@ -1,4 +1,4 @@
-# 🤖 Autonomous Customer Support AI Agent & Evaluation Engine
+# SafeTweet - Autonomous Customer Support AI Agent & Evaluation Engine
 
 ## Executive Overview
 This repository contains an end-to-end, reproducible AI support system built on real multi-turn Twitter customer service datasets (~3M tweets from the Kaggle dataset, centered on `@AmazonHelp`).
