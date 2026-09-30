@@ -150,7 +150,7 @@ GI          |    0     0     0     0     0     0
 ## Repository Structure
 
 ```text
-support-agent/
+SafeTweet/
 ├── data/
 │   ├── raw_sample.csv          # Subsampled Twitter dialogue threads (~5k records)
 │   ├── twcs.csv                # Raw TWCS Kaggle customer support dataset
