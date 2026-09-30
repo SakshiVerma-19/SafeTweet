@@ -146,7 +146,7 @@ def run_benchmark(samples_limit: int = None):
         golden_set = golden_set[:samples_limit]
 
     print("=" * 75)
-    print(f"[HIVER AI] SUPPORT AGENT - MULTI-BASELINE BENCHMARK (N={len(golden_set)})")
+    print(f"[AUTONOMOUS AI] SUPPORT AGENT - MULTI-BASELINE BENCHMARK (N={len(golden_set)})")
     print("=" * 75)
 
     # 1. Initialize Shared LLM Client
@@ -193,7 +193,7 @@ def run_benchmark(samples_limit: int = None):
     print(rf"| **Human vs. Judge Alignment (kappa)** | {res_trivial['judge_kappa']} | {res_simple['judge_kappa']} | {res_prod['judge_kappa']} |")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run Hiver Support Agent Benchmarks")
+    parser = argparse.ArgumentParser(description="Run Support Agent Benchmarks")
     parser.add_argument("--samples", type=int, default=None,
                         help="Number of samples to evaluate (default: full 200 golden set)")
     args = parser.parse_args()

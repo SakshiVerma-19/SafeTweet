@@ -61,8 +61,8 @@ class LLMClient:
     def _call_openrouter(self, messages: list[dict], max_tokens: int = 150, temperature: float = 0.0, json_mode: bool = False) -> str:
         headers = {
             "Authorization": f"Bearer {self.openrouter_key.strip()}",
-            "HTTP-Referer": "https://github.com/hiver-support-agent",
-            "X-Title": "Hiver Support Agent",
+            "HTTP-Referer": "https://github.com/support-agent",
+            "X-Title": "Autonomous Support Agent",
             "Content-Type": "application/json"
         }
 

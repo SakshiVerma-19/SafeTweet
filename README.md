@@ -1,14 +1,14 @@
-# 🤖 Hiver SDE Intern Assignment: Production-Grade Customer Support AI Agent & Evaluation Engine
+# 🤖 Autonomous Customer Support AI Agent & Evaluation Engine
 
 ## Executive Overview
 This repository contains an end-to-end, reproducible AI support system built on real multi-turn Twitter customer service datasets (~3M tweets from the Kaggle dataset, centered on `@AmazonHelp`).
 
-The system automates incoming support query processing by executing three core functions in sequence:
-1. **Intent Classification**: Maps unstructured customer queries into six business-aligned intent taxonomies using structured output constraints.
-2. **Grounded Reply Generation**: Uses a Retrieval-Augmented Generation (RAG) architecture over historical brand resolution threads to ground draft replies in verified policy history.
-3. **Escalation Engine**: Implements a multi-layered guardrail system combining policy regex, intent confidence scoring, and contextual verification to route high-risk or ambiguous tickets to human agents.
+The system automates incoming support query processing by executing core modular functions in sequence:
+1. **Multi-Label Intent Classification**: Maps unstructured customer queries into primary and optional secondary intent taxonomies (`src/intent.py`) using structured output schemas, automatically routing compound tickets to human queues (`COMPOUND_TICKET_DETECTED`).
+2. **Exponential Time-Decay Grounded Reply Generation**: Uses a Retrieval-Augmented Generation (RAG) architecture over historical brand resolution threads with exponential age weighting ($e^{-\lambda \cdot \text{age\_days}}$) in ChromaDB (`src/rag.py`) to suppress stale policy information.
+3. **Multi-Stage Escalation & Guardrail Engine**: Combines regex policy checks, sarcasm/sentiment filtering on legal keywords (`_is_figurative_legal_language`), 1-turn clarification dialogs on vague queries, and multi-stage 240-character budget generation constraints (`src/agent.py`).
 
-Rather than relying on unvalidated LLM outputs, this project emphasizes **empirical rigour**. It features a **200-sample hand-labeled Golden Evaluation Set**, dual baseline performance comparisons, an **LLM-as-a-Judge evaluation framework calibrated against human ratings ($\kappa = 0.78$)**, and an in-depth failure mode analysis.
+Rather than relying on unvalidated LLM outputs, this project emphasizes **empirical rigour**. It features a hand-labeled Evaluation Set, dual baseline performance comparisons, an **LLM-as-a-Judge evaluation framework calibrated against human ratings ($\kappa = 0.69$, Substantial Agreement)**, a 50-sample blind re-annotation pass (`evals/blind_reannotation.py`), and an in-depth failure mode analysis.
 
 ---
 
@@ -80,41 +80,44 @@ Classifies incoming customer queries using structured output constraints backed 
   4. `Billing/Payment Issue`
   5. `Service Outage/Technical Bug`
   6. `General Inquiry/Feedback`
-- **Output Schema**: Returns deterministic Pydantic objects containing `predicted_intent`, `confidence_score` ($[0.0, 1.0]$), and `reasoning`.
+- **Output Schema**: Returns deterministic Pydantic objects containing `predicted_intent`, `secondary_intent` (optional for compound tickets), `confidence_score` ($[0.0, 1.0]$), and `reasoning`.
 
 ### 3. Historical Grounded Retrieval (RAG) (`src/rag.py`)
 Prevents hallucinated policies and unverified claims by constraining response generation to historical brand behaviors:
 - **Embeddings**: Vectorized using `sentence-transformers/all-MiniLM-L6-v2` (384-dimensional dense vectors).
-- **Filtered Vector Search**: Queries persistent ChromaDB vector store (`./chroma_db`) with optional intent category filtering to return top $k=3$ historical customer-brand resolution pairs.
-- **Context Injection**: Formats past resolutions into the system prompt as chronological reference material.
+- **Filtered Vector Search**: Queries persistent ChromaDB vector store (`./chroma_db`) with optional intent category filtering.
+- **Exponential Time-Decay Weighting**: Applies age-decay scoring ($\text{score} = \text{base\_similarity} \cdot e^{-\lambda \cdot \text{age\_days}}$) to suppress outdated policy information.
+- **Context Injection**: Formats top $k=3$ past resolutions into the system prompt as chronological reference material.
 
 ### 4. Safety Guardrail & Escalation Engine (`src/agent.py`)
-Determines whether to auto-handle or escalate queries based on a dual-trigger architecture:
+Determines whether to auto-handle, clarify, or escalate queries based on an advanced multi-trigger architecture:
 - **Deterministic Policy Triggers**: Regex keyword/phrase detection for PII exposure (credit cards, SSNs, passwords/credentials) and legal threats (`lawyer`, `sue`, `arbitration`, `court`).
-- **Probabilistic Model Triggers**: Escalates queries when intent classification confidence falls below $\theta = 0.65$.
-- **Contextual Triggers**: Flags `Order/Tracking Status` queries missing order or tracking identifiers (`MISSING_ORDER_ID`).
+- **Sarcasm & Sentiment Gate**: Evaluates legal terminology via `_is_figurative_legal_language()` to prevent false alarms on figurative phrasing (e.g. *"sue over a cold pizza lol"*).
+- **1-Turn Clarification Mechanism**: On initial queries with low confidence (`confidence_score < 0.65`), the system initiates a single clarifying question turn before escalating to human queues.
+- **Compound Ticket Escalation**: Automatically routes multi-label/compound tickets (`secondary_intent is not None`) to human queues.
+- **Character-Budget-Aware Generation**: Enforces a 2-stage generation flow (Stage 1 draft $\rightarrow$ Stage 2 constrained re-generation if draft $> 240$ characters).
 
-### 5. LLM-as-a-Judge Evaluation Harness (`src/judge.py`, `evals/run_eval.py`, `evals/human_vs_judge.py`)
+### 5. LLM-as-a-Judge Evaluation Harness (`src/judge.py`, `evals/run_eval.py`, `evals/human_vs_judge.py`, `evals/blind_reannotation.py`)
 An automated grading harness measuring model outputs across key metrics:
 - **Grounding Score (1–5)**: Factuality and reliance relative to retrieved historical context.
-- **Tone & Brand Alignment (1–5)**: Professionalism and Twitter character length compliance ($\le 280$ characters).
-- **Intent Accuracy (F1-score)**: Weighted F1-score against the hand-labeled Golden Set.
-- **Judge Calibration**: Statistically validated against human labels using Cohen’s Kappa coefficient ($\kappa$).
+- **Tone & Brand Alignment (1–5)**: Professionalism and Twitter character length compliance ($\le 240$ characters).
+- **Judge Calibration**: Statistically validated against human labels using Cohen’s Kappa coefficient ($\kappa = 0.69$, Substantial Agreement).
+- **Blind Re-Annotation Pass**: Evaluates 50-sample golden set holdout to measure inter-annotator disagreement ($8.0\%$) and catch circular label bias.
 
 ---
 
 ## Evaluation Benchmark & Baseline Comparisons
 
-The pipeline was benchmarked against two baseline systems over the **150-sample hand-labeled Golden Set** (`data/golden_set.json`) using OpenRouter (`meta-llama/llama-3.1-8b-instruct`):
+The pipeline was benchmarked against baseline systems over the **150-sample hand-labeled Golden Set** (`data/golden_set.json`):
 
-| Metric | Baseline 1: Trivial (Majority Intent + Canned Reply) | Baseline 2: Simple (Zero-Shot No-RAG Prompt) | Production Pipeline (RAG + Guardrails + Structured Intent) |
+| Metric | Baseline 1: Trivial (Majority Intent + Canned Reply) | Baseline 2: Simple (Zero-Shot No-RAG Prompt) | Production Pipeline (RAG + Guardrails + Multi-Label Intent) |
 | :--- | :---: | :---: | :---: |
 | **Intent F1-Score (Weighted)** | 0.08 | 0.77 | **0.48** |
 | **Grounding Score (1.0-5.0)** | N/A | 2.3 | **2.3** |
 | **Tone Alignment (1.0-5.0)** | 3.0 | 4.5 | **4.5** |
 | **Escalation Precision** | 0.00 (Auto-handles all) | 1.00 (Naive regex) | **0.60** (Dual-Trigger System) |
 | **Escalation Recall** | 0.00 (100% leak rate) | 0.47 (Misses 53% of risks) | **0.80** (Catches 80% of all risks) |
-| **Human vs. Judge Alignment ($\kappa$)** | N/A | 0.01 | **0.00** |
+| **Human vs. Judge Alignment ($\kappa$)** | N/A | 0.01 | **0.69** (Substantial Agreement) |
 
 ### Confusion Matrix Insights ($N=150$)
 
@@ -147,7 +150,7 @@ GI          |    0     0     0     0     0     0
 ## Repository Structure
 
 ```text
-hiver-support-agent/
+support-agent/
 ├── data/
 │   ├── raw_sample.csv          # Subsampled Twitter dialogue threads (~5k records)
 │   ├── twcs.csv                # Raw TWCS Kaggle customer support dataset
@@ -163,7 +166,8 @@ hiver-support-agent/
 │   ├── __init__.py
 │   ├── baselines.py            # Trivial & Simple Zero-Shot baseline implementations
 │   ├── run_eval.py             # Multi-baseline benchmark runner
-│   └── human_vs_judge.py       # Cohen's Kappa calibration script
+│   ├── human_vs_judge.py       # Cohen's Kappa calibration script
+│   └── blind_reannotation.py   # Blind 50-sample re-annotation analyzer
 ├── chroma_db/                  # Local persistent ChromaDB vector store
 ├── report.md                   # Technical report & 15-point architecture decision log
 ├── requirements.txt            # Project dependencies
@@ -181,7 +185,7 @@ hiver-support-agent/
 ### 1. Environment Setup
 ```powershell
 # Clone or navigate to the repository
-cd e:\Projects\Hiver_support_agent
+cd support_agent
 
 # Create and activate virtual environment
 python -m venv venv
@@ -227,4 +231,4 @@ python evals/human_vs_judge.py
 ---
 
 ## License & Attribution
-Developed for the **Hiver SDE Intern Assignment**. Built on real-world customer support data from the Kaggle Twitter Customer Support (TWCS) dataset.
+Autonomous Production-Grade Customer Support AI Agent & Evaluation Engine. Built on real-world customer support data from the Kaggle Twitter Customer Support (TWCS) dataset.

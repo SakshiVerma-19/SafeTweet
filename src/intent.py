@@ -3,6 +3,7 @@ import os
 import json
 import re
 from enum import Enum
+from typing import Optional
 from pydantic import BaseModel, Field
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,9 +19,10 @@ class IntentCategory(str, Enum):
     GENERAL_INQUIRY = "General Inquiry/Feedback"
 
 class IntentClassificationResult(BaseModel):
-    predicted_intent: IntentCategory = Field(description="Most suitable category for customer query.")
+    predicted_intent: IntentCategory = Field(description="Primary intent category for customer query.")
+    secondary_intent: Optional[IntentCategory] = Field(default=None, description="Optional secondary intent category if query contains compound intents.")
     confidence_score: float = Field(description="Confidence level between 0.0 and 1.0.")
-    reasoning: str = Field(description="Brief justification for chosen intent.")
+    reasoning: str = Field(description="Brief justification for chosen intent(s).")
 
 class IntentClassifier:
     def __init__(self, llm_client: LLMClient = None, generator_pipeline=None):
@@ -38,7 +40,8 @@ class IntentClassifier:
                 "role": "system",
                 "content": (
                     "You are a customer intent classification system.\n"
-                    f"Classify the input query into EXACTLY ONE of these categories: {categories}\n"
+                    f"Classify the input query into a primary intent (`predicted_intent`) and optionally a secondary intent (`secondary_intent`) from these categories: {categories}\n"
+                    "If the query contains compound/multiple requests, emit the secondary intent; otherwise set `secondary_intent` to null.\n"
                     "Respond STRICTLY in JSON matching this JSON schema:\n"
                     f"{schema_json}"
                 )

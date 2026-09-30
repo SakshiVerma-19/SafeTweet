@@ -1,4 +1,6 @@
 import os
+import math
+from datetime import datetime
 import pandas as pd
 import chromadb
 from chromadb.utils import embedding_functions
@@ -8,9 +10,10 @@ DEFAULT_DB_PATH = os.path.join(BASE_DIR, "chroma_db")
 DEFAULT_SAMPLE_PATH = os.path.join(BASE_DIR, "data", "raw_sample.csv")
 
 class RAGRetriever:
-    def __init__(self, db_path: str = DEFAULT_DB_PATH, collection_name: str = "amazon_support_history"):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH, collection_name: str = "amazon_support_history", decay_lambda: float = 0.001):
         print(f"Initializing ChromaDB at '{db_path}' and local embedding model...")
         self.client = chromadb.PersistentClient(path=db_path)
+        self.decay_lambda = decay_lambda  # Exponential time decay rate per day
         
         # Local open-source embedding function
         self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -41,7 +44,8 @@ class RAGRetriever:
             documents.append(str(row["customer_text"]))
             metadatas.append({
                 "brand_response": str(row["brand_response"]),
-                "customer_tweet_id": str(row["customer_tweet_id"])
+                "customer_tweet_id": str(row["customer_tweet_id"]),
+                "created_at": str(row.get("created_at", ""))
             })
             ids.append(f"doc_{idx}")
 
@@ -55,14 +59,28 @@ class RAGRetriever:
             )
         print(f"Successfully indexed {len(documents)} resolution pairs into ChromaDB.")
 
+    def _parse_created_at(self, date_str: str) -> datetime | None:
+        if not date_str:
+            return None
+        # Example format: "Wed Nov 22 09:23:01 +0000 2017"
+        try:
+            return datetime.strptime(date_str, "%a %b %d %H:%M:%S %z %Y")
+        except Exception:
+            try:
+                return pd.to_datetime(date_str)
+            except Exception:
+                return None
+
     def retrieve_context(self, query: str, intent: str = None, top_k: int = 3) -> list:
         """
         Retrieves top_k similar historical resolution pairs for grounding.
-        Optionally filters by intent category if metadata exists.
+        Applies exponential age-decay scoring to suppress outdated policy information.
         """
+        fetch_k = max(top_k * 3, 10)
         query_kwargs = {
             "query_texts": [query],
-            "n_results": top_k
+            "n_results": fetch_k,
+            "include": ["documents", "metadatas", "distances"]
         }
         if intent:
             query_kwargs["where"] = {"intent": intent}
@@ -71,17 +89,47 @@ class RAGRetriever:
             results = self.collection.query(**query_kwargs)
         except Exception:
             # Fallback to query without metadata filter if intent filter isn't present
-            results = self.collection.query(query_texts=[query], n_results=top_k)
+            query_kwargs.pop("where", None)
+            results = self.collection.query(**query_kwargs)
 
-        retrieved_contexts = []
+        scored_candidates = []
+        now = datetime.now().astimezone()
+
         if results and "documents" in results and results["documents"]:
-            for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-                retrieved_contexts.append({
+            docs = results["documents"][0]
+            metas = results["metadatas"][0]
+            distances = results.get("distances", [[]])[0] if "distances" in results else [0.5] * len(docs)
+
+            for doc, meta, dist in zip(docs, metas, distances):
+                # Convert L2 / Cosine distance to similarity (1 / (1 + dist))
+                base_similarity = 1.0 / (1.0 + float(dist)) if dist is not None else 0.5
+                
+                # Calculate time decay
+                created_at_str = meta.get("created_at", "")
+                doc_dt = self._parse_created_at(created_at_str)
+
+                if doc_dt:
+                    try:
+                        age_days = (now - doc_dt).total_seconds() / 86400.0
+                        time_weight = math.exp(-self.decay_lambda * max(age_days, 0.0))
+                    except Exception:
+                        time_weight = 1.0
+                else:
+                    time_weight = 1.0
+
+                final_score = base_similarity * time_weight
+
+                scored_candidates.append({
                     "historical_customer_query": doc,
-                    "historical_brand_response": meta.get("brand_response", "")
+                    "historical_brand_response": meta.get("brand_response", ""),
+                    "score": final_score,
+                    "base_similarity": base_similarity,
+                    "time_weight": time_weight
                 })
 
-        return retrieved_contexts
+        # Rank by time-decay adjusted score
+        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+        return scored_candidates[:top_k]
 
 if __name__ == "__main__":
     retriever = RAGRetriever()

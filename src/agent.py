@@ -13,11 +13,14 @@ from src.rag import RAGRetriever
 class ExecutionResult(BaseModel):
     customer_message: str
     predicted_intent: str
+    secondary_intent: str | None = None
     confidence_score: float
     escalated: bool
     escalation_reason: str | None = None
     retrieved_context: list[dict] | None = None
     final_response: str
+    is_clarification_asked: bool = False
+    clarification_question: str | None = None
 
 class SupportAgent:
     def __init__(self, llm_client: LLMClient = None):
@@ -49,15 +52,36 @@ class SupportAgent:
         self.sentiment_patterns = [
             r'\b(scam|fraudulent|fraud|thieves|cheaters|disgusting|horrible|worst service)\b'
         ]
+        self.sarcasm_hyperbole_patterns = [
+            r'\b(jk|just kidding|lol|lmao|rofl|sarcasm|sarcastic|figuratively|hyperbole|not actually|not literally)\b',
+            r'\b(sue if my \w+ is|gonna sue over a|suing for \$1)\b'
+        ]
 
-    def _check_escalation(self, text: str, confidence_score: float, predicted_intent: str | None = None) -> tuple[bool, str | None]:
+    def _is_figurative_legal_language(self, text: str) -> bool:
+        """
+        Lightweight sentiment/sarcasm gate to filter out figurative legal expressions.
+        """
+        for pattern in self.sarcasm_hyperbole_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+
+    def _check_escalation(
+        self, text: str, confidence_score: float, predicted_intent: str | None = None, secondary_intent: str | None = None, is_followup: bool = False
+    ) -> tuple[bool, str | None]:
         for pattern in self.pii_patterns:
             if re.search(pattern, text, re.IGNORECASE):
                 return True, "PII_EXPOSURE_RISK"
 
+        # Compound Ticket Routing Rule (Multi-label intent escalation)
+        if secondary_intent is not None:
+            return True, "COMPOUND_TICKET_DETECTED"
+
         for pattern in self.legal_patterns:
             if re.search(pattern, text, re.IGNORECASE):
-                return True, "LEGAL_RISK_DETECTED"
+                # Sentiment & Sarcasm Gate: Check if legal terminology is figurative/sarcastic
+                if not self._is_figurative_legal_language(text):
+                    return True, "LEGAL_RISK_DETECTED"
 
         # Sentiment Velocity Check: Extreme negative sentiment or hostility
         for pattern in self.sentiment_patterns:
@@ -65,7 +89,8 @@ class SupportAgent:
                 return True, "HIGH_NEGATIVE_SENTIMENT"
 
         if confidence_score < 0.65:
-            return True, "LOW_INTENT_CONFIDENCE"
+            reason = "LOW_INTENT_CONFIDENCE_PERSISTENT" if is_followup else "LOW_INTENT_CONFIDENCE"
+            return True, reason
 
         # Context Trigger: Missing required order/tracking number for tracking status requests
         if predicted_intent == "Order/Tracking Status":
@@ -75,17 +100,42 @@ class SupportAgent:
 
         return False, None
 
-    def process_ticket(self, customer_message: str) -> ExecutionResult:
-        intent_res = self.intent_classifier.classify(customer_message)
+    def process_ticket(self, customer_message: str, previous_turn_message: str | None = None) -> ExecutionResult:
+        is_followup = bool(previous_turn_message)
+        effective_query = f"{previous_turn_message} (Clarification: {customer_message})" if is_followup else customer_message
+
+        intent_res = self.intent_classifier.classify(effective_query)
+        sec_intent_val = intent_res.secondary_intent.value if intent_res.secondary_intent else None
 
         should_escalate, reason_code = self._check_escalation(
-            customer_message, intent_res.confidence_score, intent_res.predicted_intent.value
+            effective_query,
+            intent_res.confidence_score,
+            intent_res.predicted_intent.value,
+            secondary_intent=sec_intent_val,
+            is_followup=is_followup
         )
+
+        # Task 5: Handle LOW_INTENT_CONFIDENCE with a 1-turn clarification attempt on initial turn
+        if should_escalate and reason_code == "LOW_INTENT_CONFIDENCE" and not is_followup:
+            clarifying_q = "Could you please clarify your request? E.g., provide your order ID, account details, or specific issue so we can assist you."
+            return ExecutionResult(
+                customer_message=customer_message,
+                predicted_intent=intent_res.predicted_intent.value,
+                secondary_intent=sec_intent_val,
+                confidence_score=intent_res.confidence_score,
+                escalated=False,
+                escalation_reason=None,
+                retrieved_context=None,
+                final_response=clarifying_q,
+                is_clarification_asked=True,
+                clarification_question=clarifying_q
+            )
 
         if should_escalate:
             return ExecutionResult(
                 customer_message=customer_message,
                 predicted_intent=intent_res.predicted_intent.value,
+                secondary_intent=sec_intent_val,
                 confidence_score=intent_res.confidence_score,
                 escalated=True,
                 escalation_reason=reason_code,
@@ -106,7 +156,7 @@ class SupportAgent:
                     "You are @AmazonHelp official Twitter support agent.\n"
                     "Draft a helpful, professional tweet response based ONLY on the verified policy history below.\n"
                     "Strict Constraints:\n"
-                    "1. Response length MUST NOT exceed 280 characters.\n"
+                    "1. Response length MUST NOT exceed 240 characters.\n"
                     "2. Do not invent unverified claims or policies.\n\n"
                     f"Verified Policy History Context:\n{context_str}"
                 )
@@ -114,19 +164,40 @@ class SupportAgent:
             {"role": "user", "content": customer_message}
         ]
 
-        raw_response = self.llm.chat_completion(prompt_messages, max_tokens=120, temperature=0.0)
+        # Stage 1: Initial Generation Draft
+        first_draft = self.llm.chat_completion(prompt_messages, max_tokens=120, temperature=0.0)
 
-        if len(raw_response) > 280:
-            raw_response = raw_response[:277] + "..."
+        # Stage 2: Character-budget-aware re-generation if draft exceeds 240 chars
+        if len(first_draft) > 240:
+            refine_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert tweet editor for @AmazonHelp.\n"
+                        "Your task is to condense and rephrase the following draft response so that it is STRICTLY under 240 characters.\n"
+                        "Preserve the key resolution steps and polite tone, but make it concise.\n"
+                        "Output ONLY the final revised response text."
+                    )
+                },
+                {"role": "user", "content": f"Draft response to condense:\n'{first_draft}'"}
+            ]
+            final_response = self.llm.chat_completion(refine_messages, max_tokens=100, temperature=0.0).strip()
+            
+            # Fallback character hard-cut if LLM still exceeds 240 chars
+            if len(final_response) > 240:
+                final_response = final_response[:237] + "..."
+        else:
+            final_response = first_draft
 
         return ExecutionResult(
             customer_message=customer_message,
             predicted_intent=intent_res.predicted_intent.value,
+            secondary_intent=sec_intent_val,
             confidence_score=intent_res.confidence_score,
             escalated=False,
             escalation_reason=None,
             retrieved_context=contexts,
-            final_response=raw_response
+            final_response=final_response
         )
 
 if __name__ == "__main__":
